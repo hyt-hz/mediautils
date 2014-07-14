@@ -1,5 +1,7 @@
 import struct
 import traceback
+import logging
+
 
 
 class FileCache(object):
@@ -79,7 +81,7 @@ class FileCache(object):
 class BoxMetaClass(type):
     def __init__(cls, name, bases, dct):
 
-        if hasattr(dct, 'boxtype'):
+        if hasattr(cls, 'boxtype'):
             cls.box_classes[cls.boxtype] = cls
 
         super(BoxMetaClass, cls).__init__(name, bases, dct)
@@ -90,11 +92,11 @@ class Box(object):
     box_classes = {}  # key value pair of box type name and corresponding subclass
                       # filled by metaclass
     __metaclass__ = BoxMetaClass
+    direct_children = False
 
-    def __init__(self, data, parent, end):
-        self._box_offset = data.tell()
+    def __init__(self, data, parent):
+        self.box_offset = data.tell()
         self.parent = parent
-        self.end = end
         self.size, = struct.unpack('>I', data.read(4))
         self.type = data.read(4)
         self.next = None
@@ -107,59 +109,99 @@ class Box(object):
             pass
         else:
             pass
-        self._body_offset = data.tell()
+        self.body_offset = data.tell()
         self._parse(data)
 
-        # next box
-        if self.size == 0:
-            return
-        elif not end or self._box_offset + self.size < end:
-            try:
-                data.seek(self._box_offset + self.size)
-                self.next = Box.factory(data, parent, end)
-            except Exception:
-                print 'Failed to parse the following BOX of box {}'.format(self.type), traceback.format_exc()
-
     def _parse(self, data):
-        pass
+        if self.direct_children:
+            self._parse_child(data)
+        else:
+            data.seek(self.box_offset+self.size)
+
+    def _parse_child(self, data):
+        while True:
+            if self.parent and self.parent.end_offset and data.tell() >= self.parent.end_offset:
+                return
+            if self.end_offset and data.tell() >= self.end_offset:
+                return
+            try:
+                child = Box.factory(data, self)
+            except Exception:
+                print traceback.format_exc()
+                return
+            if child:
+                self.children.append(child)
+            else:
+                return
 
     def iter(self):
-        yield self
         for child in self.children:
-            for box in self.child.iter():
-                yield box
-        if self.next:
-            for box in self.next.iter():
+            yield child
+            for box in child.iter():
                 yield box
 
+    def iter_child(self):
+        for child in self.children:
+            yield child
+
+    @property
+    def end_offset(self):
+        if self.size:
+            return self.box_offset + self.size
+        else:
+            return 0
+
     @classmethod
-    def factory(cls, data, parent, end):
+    def factory(cls, data, parent):
         boxtype = data.peek(8)[4:8]
         if len(boxtype) == 0:
             return None
         if boxtype in cls.box_classes:
-            return cls.box_classes[boxtype](data, parent, end)
+            return cls.box_classes[boxtype](data, parent)
         else:
-            return cls(data, parent, end)
+            return cls(data, parent)
+
+
+class BoxRoot(Box):
+    boxtype = 'ROOT'
+    direct_children = True
+
+    def __init__(self, data):
+        self.box_offset = data.tell()
+        self.body_offset = self.box_offset
+        self.parent = None
+        self.size = 0
+        self.type = self.boxtype
+        self.children = []
+        self._parse(data)
 
 
 class BoxMoov(Box):
     boxtype = 'moov'
 
     def _parse(self, data):
-        self.version, = struct.unpack('>B', self.body[0:1])
-        # 3 byte flag
+        self._parse_child(data)
 
 
 class BoxTrak(Box):
     boxtype = 'trak'
+    direct_children = True
 
+
+class BoxMdia(Box):
+    boxtype = 'mdia'
+    direct_children = True
 
 
 if __name__ == '__main__':
+
+    def print_child(box, prefix=''):
+        for child in box.iter_child():
+            print prefix, child.type
+            print_child(child, prefix+'  ')
+
     with open('ted.mp4', 'rb') as f:
         data = FileCache(f)
-        mp4 = Box.factory(data, None, None)
-        for box in mp4.iter():
-            print box.type
+        mp4 = BoxRoot(data)
+        print_child(mp4)
 

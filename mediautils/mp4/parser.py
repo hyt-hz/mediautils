@@ -134,15 +134,12 @@ class Box(object):
             else:
                 return
 
-    def iter(self):
+    def iter_child(self, deep=False):
         for child in self.children:
             yield child
-            for box in child.iter():
-                yield box
-
-    def iter_child(self):
-        for child in self.children:
-            yield child
+            if deep:
+                for box in child.iter_child(deep=True):
+                    yield box
 
     @property
     def end_offset(self):
@@ -150,6 +147,16 @@ class Box(object):
             return self.box_offset + self.size
         else:
             return 0
+
+    def find_children(self, box_type, deep=False, only_first=False):
+        children = []
+        for child in self.iter_child(deep=deep):
+            if child.type == box_type:
+                if only_first:
+                    return child
+                else:
+                    children.append(child)
+        return children
 
     @classmethod
     def factory(cls, data, parent):
@@ -193,15 +200,103 @@ class BoxMdia(Box):
     direct_children = True
 
 
+class BoxMdhd(Box):
+    boxtype = 'mdhd'
+
+    def _parse(self, data):
+        self.version, = struct.unpack('>B', data.read(1))
+        self.flag = data.read(3)
+        if self.version == 0:
+            self.creation_time, = struct.unpack('>I', data.read(4))
+            self.modification_time, = struct.unpack('>I', data.read(4))
+            self.timescale, = struct.unpack('>I', data.read(4))
+            self.duration, = struct.unpack('>I', data.read(4))
+        else:
+            self.creation_time, = struct.unpack('>Q', data.read(8))
+            self.modification_time, = struct.unpack('>Q', data.read(8))
+            self.timescale, = struct.unpack('>I', data.read(4))
+            self.duration, = struct.unpack('>Q', data.read(8))
+        data.forward(4)
+
+
+class BoxMinf(Box):
+    boxtype = 'minf'
+    direct_children = True
+
+
+class BoxStbl(Box):
+    boxtype = 'stbl'
+    direct_children = True
+
+
+class BoxStts(Box):
+    boxtype = 'stts'
+
+    def _parse(self, data):
+        self.version = data.read(1)
+        self.flag = data.read(3)
+        self.entry_count, = struct.unpack('>I', data.read(4))
+        self._entries = data.read(self.entry_count*8)
+
+    def iter_time_to_sample(self):
+        offset = 0
+        end_offset = self.entry_count*8
+        while offset + 8 <= end_offset:
+            yield struct.unpack('>I', self._entries[offset:offset+4])[0], struct.unpack('>I', self._entries[offset+4:offset+8])[0]
+            offset += 8
+
+    def sample_time(self, sample):
+        accum_samples = 0
+        accum_time = 0
+        for sample_count, sample_delta in self.iter_time_to_sample():
+            if sample < accum_samples + sample_count:
+                return accum_time + (sample - accum_samples)*sample_delta
+            accum_samples += sample_count
+            accum_time += sample_count*sample_delta
+
+
+class BoxStss(Box):
+    # return sample starts from 0 instead of from 1
+    boxtype = 'stss'
+
+    def _parse(self, data):
+        self.version = data.read(1)
+        self.flag = data.read(3)
+        self.entry_count, = struct.unpack('>I', data.read(4))
+        self._entries = data.read(self.entry_count*4)
+
+    def sync_sample(self, index):
+        if index+1 > self.entry_count:
+            raise Exception('stss index {} too large'.format(index))
+        return struct.unpack('>I', self._entries[index*4:index*4+4])[0] - 1
+
+    def iter_sync_sample(self):
+        offset = 0
+        end_offset = self.entry_count*4
+        while offset + 4 <= end_offset:
+            yield struct.unpack('>I', self._entries[offset:offset+4])[0] - 1
+            offset += 4
+
+
 if __name__ == '__main__':
 
-    def print_child(box, prefix=''):
+    def print_all_children(box, prefix=''):
         for child in box.iter_child():
             print prefix, child.type
-            print_child(child, prefix+'  ')
+            print_all_children(child, prefix+'  ')
 
     with open('ted.mp4', 'rb') as f:
         data = FileCache(f)
         mp4 = BoxRoot(data)
-        print_child(mp4)
+        print_all_children(mp4)
+
+    print '\nstss data:'
+    for trak in mp4.find_children('trak', deep=True):
+        stts = trak.find_children('stts', deep=True, only_first=True)
+        stss = trak.find_children('stss', deep=True, only_first=True)
+        mdhd = trak.find_children('mdhd', deep=True, only_first=True)
+        if stts and stss:
+            for sync_sample in stss.iter_sync_sample():
+                print sync_sample, stts.sample_time(sync_sample), float(stts.sample_time(sync_sample))/mdhd.timescale
+
 
